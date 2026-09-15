@@ -1,58 +1,117 @@
 # -------------------------------------------------------------
 #  Geneva Mechanism Generator
 # -------------------------------------------------------------
-bl_info = {
-    "name":        "Geneva Mechanism",
-    "author":      "TessaCoil - help from o3",
-    "version":     (1, 0, 0),
-    "blender":     (3, 0, 0),
-    "location":    "Add > Mesh",
-    "description": "Generates a Geneva Mechanism with Adjustable Parameters",
-    "category":    "Add Mesh",
-}
+import bpy
+import bmesh
+import math
 
-import bpy, math, textwrap, re
 
+def _link_mesh_object(context, name, bm):
+    mesh = bpy.data.meshes.new(name)
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    context.collection.objects.link(obj)
+    return obj
+
+
+def _add_cylinder(context, name, radius, depth, segments, location=(0.0, 0.0, 0.0)):
+    bm = bmesh.new()
+    bmesh.ops.create_cone(
+        bm,
+        cap_ends=True,
+        cap_tris=False,
+        segments=segments,
+        radius1=radius,
+        radius2=radius,
+        depth=depth,
+    )
+    obj = _link_mesh_object(context, name, bm)
+    obj.location = location
+    return obj
+
+
+def _add_cube(context, name, size, location=(0.0, 0.0, 0.0)):
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=size)
+    obj = _link_mesh_object(context, name, bm)
+    obj.location = location
+    return obj
+
+
+def _resolve_solver(name):
+    """The Boolean modifier's 'FAST' solver was renamed to 'FLOAT' in
+    newer Blender versions. Resolve to whichever name the running
+    Blender actually supports."""
+    items = bpy.types.BooleanModifier.bl_rna.properties['solver'].enum_items
+    if name in items:
+        return name
+    if name == 'FAST' and 'FLOAT' in items:
+        return 'FLOAT'
+    return 'EXACT'
+
+
+def _apply_boolean(context, target, other, operation, solver):
+    """Boolean target with other and bake the result into target's mesh,
+    without relying on bpy.ops.object.modifier_add/apply."""
+    mod = target.modifiers.new(name="Boolean", type='BOOLEAN')
+    mod.operation = operation
+    mod.solver = _resolve_solver(solver)
+    mod.object = other
+
+    depsgraph = context.evaluated_depsgraph_get()
+    eval_obj = target.evaluated_get(depsgraph)
+    new_mesh = bpy.data.meshes.new_from_object(eval_obj)
+
+    old_mesh = target.data
+    target.modifiers.remove(mod)
+    target.data = new_mesh
+    if old_mesh.users == 0:
+        bpy.data.meshes.remove(old_mesh)
+
+
+def _remove_object(obj):
+    if obj is None:
+        return
+    mesh = obj.data
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh is not None and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
 
 
 # ----------------------------------------------------------------
 #  Operator — supplies parameters and runs the script
 # ----------------------------------------------------------------
 class MESH_OT_geneva_wrapper(bpy.types.Operator):
-    bl_idname  = "mesh.geneva_mechanism"
-    bl_label   = "Geneva Mechanism"
+    bl_idname = "mesh.geneva_mechanism"
+    bl_label = "Geneva Mechanism"
     bl_options = {'REGISTER', 'UNDO'}
 
     # parameters (defaults are the same as in the original code)
-    genevaHeight              : bpy.props.FloatProperty(default=0.4,  name="Height")
-    genevaWheelRadius         : bpy.props.FloatProperty(default=3.0,  name="Wheel Radius")
-    genevaWheelSlotQuantity   : bpy.props.IntProperty  (default=6,    name="Wheel Slot Quantity", min=3)
-    genevaCrankPinRadius    : bpy.props.FloatProperty(default=0.125, name="Crank-Pin Radius")
-    allowedClearance          : bpy.props.FloatProperty(default=0.05, name="Slot Clearance")
-    pinTolerence              : bpy.props.FloatProperty(default=0.05, name="Pin Tol.")
-    stopDiscTolerence         : bpy.props.FloatProperty(default=0.05, name="Stop-Disc Tol.")
-    stopDiscCutoutTolerence   : bpy.props.FloatProperty(default=0.05, name="Stop-Cutout Tol.")
-    baseTolerence             : bpy.props.FloatProperty(default=0.05, name="Base Tol.")
-    wheelHoleSize             : bpy.props.FloatProperty(default=0.25, name="Wheel Hole Radius")
-    crankHoleSize             : bpy.props.FloatProperty(default=0.25, name="Crank Hole Radius")
-    holeTolerence             : bpy.props.FloatProperty(default=0.05, name="Hole Tol.")
-    vertices                  : bpy.props.IntProperty  (default=128,  name="Cylinder Verts", min=3, max=512)
-
+    genevaHeight: bpy.props.FloatProperty(default=0.4, name="Height")
+    genevaWheelRadius: bpy.props.FloatProperty(default=3.0, name="Wheel Radius")
+    genevaWheelSlotQuantity: bpy.props.IntProperty(default=6, name="Wheel Slot Quantity", min=3)
+    genevaCrankPinRadius: bpy.props.FloatProperty(default=0.125, name="Crank-Pin Radius")
+    allowedClearance: bpy.props.FloatProperty(default=0.05, name="Slot Clearance")
+    pinTolerence: bpy.props.FloatProperty(default=0.05, name="Pin Tol.")
+    stopDiscTolerence: bpy.props.FloatProperty(default=0.05, name="Stop-Disc Tol.")
+    stopDiscCutoutTolerence: bpy.props.FloatProperty(default=0.05, name="Stop-Cutout Tol.")
+    baseTolerence: bpy.props.FloatProperty(default=0.05, name="Base Tol.")
+    wheelHoleSize: bpy.props.FloatProperty(default=0.25, name="Wheel Hole Radius")
+    crankHoleSize: bpy.props.FloatProperty(default=0.25, name="Crank Hole Radius")
+    holeTolerence: bpy.props.FloatProperty(default=0.05, name="Hole Tol.")
+    vertices: bpy.props.IntProperty(default=128, name="Cylinder Verts", min=3, max=512)
 
     # ------------------------------------------------------------
     def execute(self, context):
-        
+        # remove objects created by a previous run of this operator
         prev_names = context.scene.get("geneva_objects", [])
         for name in prev_names:
-            obj = bpy.data.objects.get(name)
-            if obj:                                # may already have been deleted
-                bpy.data.objects.remove(obj, do_unlink=True)
-         
+            _remove_object(bpy.data.objects.get(name))
+
         before = set(bpy.data.objects)
-        import math
-        if bpy.context.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-        
+
         genevaHeight = self.genevaHeight
         genevaWheelRadius = self.genevaWheelRadius
         genevaWheelSlotQuantity = self.genevaWheelSlotQuantity
@@ -66,153 +125,79 @@ class MESH_OT_geneva_wrapper(bpy.types.Operator):
         crankHoleSize = self.crankHoleSize
         holeTolerence = self.holeTolerence
         vertices = self.vertices
-        
-        genevaCrankPinDiameter = genevaCrankPinRadius*2
-        centerDistance = genevaWheelRadius/math.cos(math.pi/genevaWheelSlotQuantity)
-        genevaCrankRadius = math.sqrt(centerDistance**2-genevaWheelRadius**2)
-        slotCenterLength = (genevaCrankRadius + genevaWheelRadius) - centerDistance
-        slotWidth = genevaCrankPinDiameter + allowedClearance
-        stopArcRadius = genevaCrankRadius - (genevaCrankPinDiameter*1.5)
+
+        genevaCrankPinDiameter = genevaCrankPinRadius * 2
+        centerDistance = genevaWheelRadius / math.cos(math.pi / genevaWheelSlotQuantity)
+        genevaCrankRadius = math.sqrt(centerDistance ** 2 - genevaWheelRadius ** 2)
+        slotWidth = genevaCrankPinDiameter + allowedClearance  # noqa: F841 (kept for parity with original parameters)
+        stopArcRadius = genevaCrankRadius - (genevaCrankPinDiameter * 1.5)
         stopDiscRadius = stopArcRadius - allowedClearance
-        clearanceArc = genevaWheelRadius * stopDiscRadius / genevaCrankRadius
 
-        def selectItem(name):
-            bpy.ops.object.select_all(action='DESELECT')
-            bpy.data.objects[name].select_set(True)
-            bpy.context.view_layer.objects.active = bpy.data.objects[name] 
-        
-        def applyBooleanOperator(targetName, otherName, operatorName, solver):
-            selectItem(targetName)
-            bpy.ops.object.modifier_add(type='BOOLEAN')
-            bpy.context.object.modifiers["Boolean"].operation = operatorName
-            bpy.context.object.modifiers["Boolean"].solver = solver
-            bpy.context.object.modifiers["Boolean"].object = bpy.data.objects[otherName]
-            bpy.ops.object.modifier_apply(modifier="Boolean")
+        rotateAmount = 2 * math.pi / genevaWheelSlotQuantity
 
-        bpy.ops.mesh.primitive_cylinder_add(vertices=vertices, radius=genevaWheelRadius, depth=genevaHeight/2, enter_editmode=False, align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
-        rootBoiName = bpy.context.active_object.name
-        bpy.ops.mesh.primitive_cylinder_add(vertices=vertices, radius=stopDiscRadius, depth=genevaHeight, enter_editmode=False, align='WORLD', location=(centerDistance, 0, 0), scale=(1, 1, 1))
-        beeHelperName = bpy.context.active_object.name
+        root_boi = _add_cylinder(context, "GenevaWheel", genevaWheelRadius, genevaHeight / 2, vertices, (0, 0, 0))
+        bee_helper = _add_cylinder(context, "GenevaSlotCutter", stopDiscRadius, genevaHeight, vertices, (centerDistance, 0, 0))
 
-        rotateAmount = 2*math.pi/genevaWheelSlotQuantity
-        for i in range(genevaWheelSlotQuantity):
-            applyBooleanOperator(rootBoiName, beeHelperName, "DIFFERENCE", "FAST")
-            bpy.ops.transform.rotate(value=rotateAmount, orient_axis='Z', orient_type='GLOBAL', orient_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)), orient_matrix_type='GLOBAL', constraint_axis=(False, False, True), mirror=False, use_proportional_edit=False, proportional_edit_falloff='SMOOTH', proportional_size=1, use_proportional_connected=False, use_proportional_projected=False, snap=False, snap_elements={'INCREMENT'}, use_snap_project=False, snap_target='CLOSEST', use_snap_self=True, use_snap_edit=True, use_snap_nonedit=True, use_snap_selectable=False)
-            
+        for _ in range(genevaWheelSlotQuantity):
+            _apply_boolean(context, root_boi, bee_helper, 'DIFFERENCE', 'FAST')
+            root_boi.rotation_euler.z += rotateAmount
 
-        bpy.ops.transform.rotate(value=rotateAmount/2, orient_axis='Z', orient_type='GLOBAL', orient_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)), orient_matrix_type='GLOBAL', constraint_axis=(False, False, True), mirror=False, use_proportional_edit=False, proportional_edit_falloff='SMOOTH', proportional_size=1, use_proportional_connected=False, use_proportional_projected=False, snap=False, snap_elements={'INCREMENT'}, use_snap_project=False, snap_target='CLOSEST', use_snap_self=True, use_snap_edit=True, use_snap_nonedit=True, use_snap_selectable=False)
+        root_boi.rotation_euler.z += rotateAmount / 2
+
         slotPos = centerDistance - genevaCrankRadius
-        bpy.ops.mesh.primitive_cylinder_add(vertices=vertices, radius=genevaCrankPinDiameter/2, depth=genevaHeight, enter_editmode=False, align='WORLD', location=(slotPos, 0, 0), scale=(1, 1, 1))
-        littlePokyName = bpy.context.active_object.name
-        bpy.ops.mesh.primitive_cube_add(size=genevaCrankPinDiameter, enter_editmode=False, align='WORLD', location=(slotPos+centerDistance, 0, 0), scale=(1, 1, 1))
-        helperLongCubeName = bpy.context.active_object.name
-        bpy.ops.transform.resize(value=(centerDistance/genevaCrankPinDiameter*2, 1, genevaHeight/genevaCrankPinDiameter), orient_type='GLOBAL', orient_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)), orient_matrix_type='GLOBAL', constraint_axis=(True, False, False), mirror=False, use_proportional_edit=False, proportional_edit_falloff='SMOOTH', proportional_size=1, use_proportional_connected=False, use_proportional_projected=False, snap=False, snap_elements={'INCREMENT'}, use_snap_project=False, snap_target='CLOSEST', use_snap_self=True, use_snap_edit=True, use_snap_nonedit=True, use_snap_selectable=False)
-        
-        applyBooleanOperator(littlePokyName, helperLongCubeName, "UNION", "EXACT")
+        little_poky = _add_cylinder(context, "GenevaPinCutter", genevaCrankPinDiameter / 2, genevaHeight, vertices, (slotPos, 0, 0))
+        helper_long_cube = _add_cube(context, "GenevaPinCutterExtension", genevaCrankPinDiameter, (slotPos + centerDistance, 0, 0))
+        helper_long_cube.scale.x = centerDistance / genevaCrankPinDiameter * 2
 
-        for i in range(genevaWheelSlotQuantity+1):
-            applyBooleanOperator(rootBoiName, littlePokyName, "DIFFERENCE", "EXACT")
-            bpy.ops.transform.rotate(value=rotateAmount, orient_axis='Z', orient_type='GLOBAL', orient_matrix=((1, 0, 0), (0, 1, 0), (0, 0, 1)), orient_matrix_type='GLOBAL', constraint_axis=(False, False, True), mirror=False, use_proportional_edit=False, proportional_edit_falloff='SMOOTH', proportional_size=1, use_proportional_connected=False, use_proportional_projected=False, snap=False, snap_elements={'INCREMENT'}, use_snap_project=False, snap_target='CLOSEST', use_snap_self=True, use_snap_edit=True, use_snap_nonedit=True, use_snap_selectable=False)
+        _apply_boolean(context, little_poky, helper_long_cube, 'UNION', 'EXACT')
 
-        selectItem(helperLongCubeName)
-        bpy.ops.object.delete(use_global=False, confirm=False)
+        for _ in range(genevaWheelSlotQuantity + 1):
+            _apply_boolean(context, root_boi, little_poky, 'DIFFERENCE', 'EXACT')
+            root_boi.rotation_euler.z += rotateAmount
 
-        selectItem(littlePokyName)
-        bpy.ops.object.delete(use_global=False, confirm=False)
+        _remove_object(helper_long_cube)
+        _remove_object(little_poky)
+        _remove_object(bee_helper)
 
-        selectItem(beeHelperName)
-        bpy.ops.object.delete(use_global=False, confirm=False)
+        little_poky = _add_cylinder(context, "GenevaPin", genevaCrankPinDiameter / 2 - pinTolerence, genevaHeight / 2, vertices, (slotPos, 0, 0))
+        bee_helper = _add_cylinder(context, "GenevaStopDisc", stopDiscRadius - stopDiscTolerence, genevaHeight / 2, vertices, (centerDistance, 0, 0))
+        stop_disc_cutout = _add_cylinder(context, "GenevaStopDiscCutter", genevaWheelRadius + stopDiscCutoutTolerence, genevaHeight, vertices, (0, 0, 0))
 
-        bpy.ops.mesh.primitive_cylinder_add(vertices=vertices, radius=genevaCrankPinDiameter/2-pinTolerence, depth=genevaHeight/2, enter_editmode=False, align='WORLD', location=(slotPos, 0, 0), scale=(1, 1, 1))
-        littlePokyName = bpy.context.active_object.name
+        _apply_boolean(context, bee_helper, stop_disc_cutout, 'DIFFERENCE', 'EXACT')
+        _remove_object(stop_disc_cutout)
 
-        bpy.ops.mesh.primitive_cylinder_add(vertices=vertices, radius=stopDiscRadius-stopDiscTolerence, depth=genevaHeight/2, enter_editmode=False, align='WORLD', location=(centerDistance, 0, 0), scale=(1, 1, 1))
-        beeHelperName = bpy.context.active_object.name
+        slottyBoiBaseRadius = centerDistance - slotPos + genevaCrankPinDiameter / 2 - pinTolerence
+        slotty_boi_base = _add_cylinder(context, "GenevaCrank", slottyBoiBaseRadius, genevaHeight / 2, vertices, (centerDistance, 0, -genevaHeight / 2))
 
-        bpy.ops.mesh.primitive_cylinder_add(vertices=vertices, radius=genevaWheelRadius+stopDiscCutoutTolerence, depth=genevaHeight, enter_editmode=False, align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
-        stopDiscCutoutName = bpy.context.active_object.name
+        spokyBoiBaseRadius = centerDistance - slottyBoiBaseRadius - baseTolerence
+        spoky_boi_base = _add_cylinder(context, "GenevaWheelBase", spokyBoiBaseRadius, genevaHeight / 2, vertices, (0, 0, -genevaHeight / 2))
 
-        applyBooleanOperator(beeHelperName, stopDiscCutoutName, "DIFFERENCE", "EXACT")
+        _apply_boolean(context, root_boi, spoky_boi_base, 'UNION', 'EXACT')
+        _remove_object(spoky_boi_base)
 
-        selectItem(stopDiscCutoutName)
-        bpy.ops.object.delete(use_global=False, confirm=False)
+        wheel_cutout = _add_cylinder(context, "GenevaWheelHoleCutter", wheelHoleSize, genevaHeight * 2, vertices, (0, 0, 0))
+        _apply_boolean(context, root_boi, wheel_cutout, 'DIFFERENCE', 'EXACT')
+        _remove_object(wheel_cutout)
 
-        slottyBoiBaseRadius = centerDistance-slotPos+genevaCrankPinDiameter/2-pinTolerence
+        _apply_boolean(context, slotty_boi_base, little_poky, 'UNION', 'EXACT')
+        _remove_object(little_poky)
 
-        bpy.ops.mesh.primitive_cylinder_add(vertices=vertices, radius=slottyBoiBaseRadius, depth=genevaHeight/2, enter_editmode=False, align='WORLD', location=(centerDistance, 0, -genevaHeight/2), scale=(1, 1, 1))
-        slottyBoiBaseName = bpy.context.active_object.name
+        _apply_boolean(context, slotty_boi_base, bee_helper, 'UNION', 'EXACT')
+        _remove_object(bee_helper)
 
-        spokyBoiBaseRadius = centerDistance-slottyBoiBaseRadius-baseTolerence
-        bpy.ops.mesh.primitive_cylinder_add(vertices=vertices, radius=spokyBoiBaseRadius, depth=genevaHeight/2, enter_editmode=False, align='WORLD', location=(0, 0, -genevaHeight/2), scale=(1, 1, 1))
-        spokyBoiBaseName = bpy.context.active_object.name
+        crank_cutout = _add_cylinder(context, "GenevaCrankHoleCutter", crankHoleSize, genevaHeight * 2, vertices, (centerDistance, 0, 0))
+        _apply_boolean(context, slotty_boi_base, crank_cutout, 'DIFFERENCE', 'EXACT')
+        _remove_object(crank_cutout)
 
-        applyBooleanOperator(rootBoiName, spokyBoiBaseName, "UNION", "EXACT")
-        selectItem(spokyBoiBaseName)
-        bpy.ops.object.delete(use_global=False, confirm=False)
-
-        bpy.ops.mesh.primitive_cylinder_add(vertices=vertices, radius=wheelHoleSize, depth=genevaHeight*2, enter_editmode=False, align='WORLD', location=(0, 0, 0), scale=(1, 1, 1))
-        wheelCutoutName = bpy.context.active_object.name
-        applyBooleanOperator(rootBoiName, wheelCutoutName, "DIFFERENCE", "EXACT")
-
-        selectItem(wheelCutoutName)
-        bpy.ops.object.delete(use_global=False, confirm=False)
-
-
-
-
-
-
-        applyBooleanOperator(slottyBoiBaseName, littlePokyName, "UNION", "EXACT")
-
-        selectItem(littlePokyName)
-        bpy.ops.object.delete(use_global=False, confirm=False)
-
-        applyBooleanOperator(slottyBoiBaseName, beeHelperName, "UNION", "EXACT")
-
-        selectItem(beeHelperName)
-        bpy.ops.object.delete(use_global=False, confirm=False)
-
-
-
-        bpy.ops.mesh.primitive_cylinder_add(vertices=vertices, radius=crankHoleSize, depth=genevaHeight*2, enter_editmode=False, align='WORLD', location=(centerDistance, 0, 0), scale=(1, 1, 1))
-        crankCutoutName = bpy.context.active_object.name
-
-        applyBooleanOperator(slottyBoiBaseName, crankCutoutName, "DIFFERENCE", "EXACT")
-
-        selectItem(crankCutoutName)
-        bpy.ops.object.delete(use_global=False, confirm=False)
-
-
-
-        bpy.ops.mesh.primitive_cylinder_add(vertices=vertices, radius=crankHoleSize-holeTolerence, depth=genevaHeight*2, enter_editmode=False, align='WORLD', location=(centerDistance, 0, -genevaHeight/2+genevaHeight/4), scale=(1, 1, 1))
-        crankCutoutName = bpy.context.active_object.name
-
-        bpy.ops.mesh.primitive_cylinder_add(vertices=vertices, radius=wheelHoleSize-holeTolerence, depth=genevaHeight*2, enter_editmode=False, align='WORLD', location=(0, 0, -genevaHeight/2+genevaHeight/4), scale=(1, 1, 1))
-        wheelCutoutName = bpy.context.active_object.name
-
-
-        after      = set(bpy.data.objects)
-        new_objs   = [obj.name for obj in (after - before)]
+        after = set(bpy.data.objects)
+        new_objs = [obj.name for obj in (after - before)]
         # --------------------------------------------------------
-        # 4)  Store the new list on the scene so we can delete them
-        #     next time the operator is called.
+        # Store the new list on the scene so we can delete them
+        # next time the operator is called.
         # --------------------------------------------------------
         context.scene["geneva_objects"] = new_objs
 
         return {'FINISHED'}
-
-
-# ----------------------------------------------------------------
-#  Simple sidebar panel
-# ----------------------------------------------------------------
-class VIEW3D_PT_geneva(bpy.types.Panel):
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category   = "Geneva"
-    bl_label      = "Geneva Mechanism"
-
-    def draw(self, context):
-        self.layout.operator(MESH_OT_geneva_wrapper.bl_idname, text="Create Geneva")
 
 
 # ----------------------------------------------------------------
@@ -225,17 +210,20 @@ def menu_func(self, ctx):
 # ----------------------------------------------------------------
 #  Registration
 # ----------------------------------------------------------------
-classes = (MESH_OT_geneva_wrapper, VIEW3D_PT_geneva)
+classes = (MESH_OT_geneva_wrapper,)
+
 
 def register():
     for c in classes:
         bpy.utils.register_class(c)
     bpy.types.VIEW3D_MT_mesh_add.append(menu_func)
 
+
 def unregister():
     bpy.types.VIEW3D_MT_mesh_add.remove(menu_func)
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
+
 
 if __name__ == "__main__":
     register()
